@@ -1687,11 +1687,61 @@ def main():
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
     )
 
+    # ECG Noise experiment arguments (for interpretability testing)
+    parser.add_argument(
+        "--noise_type",
+        type=str,
+        choices=["gaussian", "shuffle", "zero", "uniform"],
+        default=None,
+        help="Type of noise to inject for ECG signals (default: None = use real ECG)",
+    )
+    parser.add_argument(
+        "--noise_seed",
+        type=int,
+        default=None,
+        help="Random seed for noise generation (default: None = random)",
+    )
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        default=None,
+        help="Custom experiment name suffix for results directory",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Limit number of samples per split for quick testing",
+    )
+
     args = parser.parse_args()
 
     # Set up global logging
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
+
+    # Configure noise mode for ECG experiments (if specified)
+    if args.noise_type is not None:
+        ECGQACoTQADataset.set_noise_mode(
+            use_noise=True,
+            noise_type=args.noise_type,
+            noise_seed=args.noise_seed
+        )
+        logger.info(f"ECG Noise Mode: {args.noise_type} (seed={args.noise_seed})")
+    else:
+        ECGQACoTQADataset.set_noise_mode(use_noise=False)
+        logger.info("ECG Mode: Real signals (no noise)")
+
+    # Configure max_samples for quick testing (if specified)
+    if args.max_samples is not None:
+        logger.info(f"Limiting to {args.max_samples} samples per split")
+        original_init = ECGQACoTQADataset.__init__
+
+        def patched_init(self, *init_args, **init_kwargs):
+            init_kwargs['max_samples'] = args.max_samples
+            return original_init(self, *init_args, **init_kwargs)
+
+        ECGQACoTQADataset.__init__ = patched_init
 
     # Initialize trainer
     trainer = CurriculumTrainer(
@@ -1703,6 +1753,22 @@ def main():
         local_rank=args.local_rank,
         llm_id=args.llm_id,
     )
+
+    # Modify results directory if experiment_name is specified
+    if args.experiment_name:
+        original_results_dir = trainer.results_dir
+        new_results_dir = f"{original_results_dir}_{args.experiment_name}"
+        trainer.results_dir = new_results_dir
+        trainer._create_results_dir()
+
+        # Create symlink to stage4_sleep_cot from original location (for Stage 5)
+        stage4_source = os.path.abspath(os.path.join(original_results_dir, "stage4_sleep_cot"))
+        stage4_target = os.path.join(new_results_dir, "stage4_sleep_cot")
+        if os.path.exists(stage4_source) and not os.path.exists(stage4_target):
+            os.symlink(stage4_source, stage4_target)
+            logger.info(f"Created symlink: {stage4_target} -> {stage4_source}")
+
+        logger.info(f"Results directory: {trainer.results_dir}")
 
     # Run curriculum
     results = trainer.run_curriculum(args.stages, args.batch_size, args.eval_only)

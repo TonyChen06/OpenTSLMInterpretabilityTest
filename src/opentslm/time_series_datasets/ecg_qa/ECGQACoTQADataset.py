@@ -14,20 +14,25 @@ import numpy as np
 class ECGQACoTQADataset(QADataset):
     """
     ECG-QA Chain-of-Thought Dataset for question answering with electrocardiogram data.
-    
-    This dataset combines ECG time series data from PTB-XL with 
+
+    This dataset combines ECG time series data from PTB-XL with
     question-answer pairs and chain-of-thought reasoning from the ECG-QA CoT dataset.
-    
+
     Requires: pip install wfdb
     """
-    
-    def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str, 
+
+    # Class-level noise configuration (shared across all instances for interpretability testing)
+    _use_noise = False
+    _noise_type = "gaussian"  # Options: "gaussian", "shuffle", "zero", "uniform"
+    _noise_seed = None  # For reproducibility
+
+    def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str,
                  format_sample_str: bool = False, time_series_format_function=None,
                  max_samples: int = None, exclude_comparison: bool = False,
                  preload_processed_data: bool = True):
         """
         Initialize ECG-QA CoT Dataset.
-        
+
         Args:
             split: Dataset split to load
             EOS_TOKEN: End-of-sequence token
@@ -41,6 +46,70 @@ class ECGQACoTQADataset(QADataset):
         self.exclude_comparison = exclude_comparison
         self.preload_processed_data = preload_processed_data
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
+
+    @classmethod
+    def set_noise_mode(cls, use_noise: bool, noise_type: str = "gaussian", noise_seed: int = None):
+        """
+        Set noise mode for all dataset instances (for interpretability testing).
+
+        This replaces real ECG signals with noise to test if the model actually
+        uses the signal content or relies on other features (text prompts, metadata).
+
+        Args:
+            use_noise: If True, replace real ECG signals with noise
+            noise_type: Type of noise ("gaussian", "shuffle", "zero", "uniform")
+            noise_seed: Random seed for reproducibility
+        """
+        cls._use_noise = use_noise
+        cls._noise_type = noise_type
+        cls._noise_seed = noise_seed
+        if use_noise:
+            print(f"[NOISE MODE] ECG signals will be replaced with '{noise_type}' noise (seed={noise_seed})")
+
+    @classmethod
+    def get_noise_mode(cls) -> dict:
+        """Get current noise configuration."""
+        return {
+            "use_noise": cls._use_noise,
+            "noise_type": cls._noise_type,
+            "noise_seed": cls._noise_seed
+        }
+
+    @classmethod
+    def _generate_noise_signal(cls, length: int, noise_type: str, original_signal: np.ndarray = None) -> np.ndarray:
+        """
+        Generate a noise signal of the specified type.
+
+        Args:
+            length: Length of the signal to generate
+            noise_type: Type of noise ("gaussian", "shuffle", "zero", "uniform")
+            original_signal: Original signal (required for "shuffle" noise type)
+
+        Returns:
+            Noise signal as numpy array
+        """
+        # Set seed if specified for reproducibility
+        if cls._noise_seed is not None:
+            np.random.seed(cls._noise_seed)
+
+        if noise_type == "gaussian":
+            # Standard Gaussian noise (mean=0, std=1)
+            return np.random.randn(length)
+        elif noise_type == "shuffle":
+            # Shuffle the original signal (destroys temporal structure but preserves amplitude distribution)
+            if original_signal is None:
+                return np.random.randn(length)
+            shuffled = original_signal.copy()
+            np.random.shuffle(shuffled)
+            return shuffled
+        elif noise_type == "zero":
+            # All zeros (no signal)
+            return np.zeros(length)
+        elif noise_type == "uniform":
+            # Uniform random noise in [-1, 1]
+            return np.random.uniform(-1, 1, length)
+        else:
+            raise ValueError(f"Unknown noise type: {noise_type}. Options: gaussian, shuffle, zero, uniform")
 
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
         """Load the ECG-QA CoT dataset splits."""
@@ -372,51 +441,64 @@ Make sure that your last word is the answer. You MUST end your response with "An
     
     @classmethod
     def _process_ecg_lead(cls, ecg_path: str, lead_idx: int) -> Tuple[np.ndarray, float, float]:
-        """Process and cache a single ECG lead (downsample + normalize)."""
-        cache_key = f"{ecg_path}:lead_{lead_idx}"
-        
+        """Process and cache a single ECG lead (downsample + normalize), with optional noise injection."""
+        # Use different cache key when noise is enabled to avoid mixing real and noise data
+        noise_suffix = f"_noise_{cls._noise_type}" if cls._use_noise else ""
+        cache_key = f"{ecg_path}:lead_{lead_idx}{noise_suffix}"
+
         if cache_key not in cls._processed_ecg_cache:
             # Load raw ECG data
             ecg_signal, original_freq, target_freq = cls._load_ecg_data(ecg_path)
-            
+
             # Extract lead signal
             if len(ecg_signal.shape) > 1:
                 lead_signal = ecg_signal[:, lead_idx]
             else:
                 lead_signal = ecg_signal
-            
+
             if len(lead_signal) == 0:
                 raise ValueError(f"Lead {lead_idx} is empty for file {ecg_path}")
-            
+
             # Downsample if needed
             if len(lead_signal) > 1000:  # Likely 500Hz data
                 downsampled_signal = lead_signal[::5]  # Downsample to 100Hz
             else:  # Already 100Hz data
                 downsampled_signal = lead_signal
-            
+
             if len(downsampled_signal) == 0:
                 raise ValueError(f"Downsampled signal is empty for lead {lead_idx} in file {ecg_path}")
-            
+
             # Normalize the signal
             mean_val = float(np.mean(downsampled_signal))
             std_val = float(np.std(downsampled_signal))
-            
+
             if np.isnan(mean_val) or np.isnan(std_val):
                 raise ValueError(f"NaN values detected in ECG signal statistics for lead {lead_idx} in file {ecg_path}")
-            
+
             if std_val > 1e-6:  # Avoid division by zero
                 normalized_signal = (downsampled_signal - mean_val) / std_val
             else:
                 print(f"Warning: Lead {lead_idx} in file {ecg_path} has very low std deviation ({std_val}), signal may be flat")
                 normalized_signal = downsampled_signal - mean_val
-            
+
+            # NOISE INJECTION: Replace real signal with noise if enabled
+            if cls._use_noise:
+                original_normalized = normalized_signal.copy()
+                normalized_signal = cls._generate_noise_signal(
+                    length=len(normalized_signal),
+                    noise_type=cls._noise_type,
+                    original_signal=original_normalized
+                )
+                # Keep original stats in the text prompt for consistency
+                # This tests if the model actually uses the signal vs just the metadata
+
             # Verify normalized signal is valid
             if np.any(np.isnan(normalized_signal)) or np.any(np.isinf(normalized_signal)):
                 raise ValueError(f"Invalid values (NaN/Inf) in normalized signal for lead {lead_idx} in file {ecg_path}")
-            
+
             # Cache the processed signal and statistics
             cls._processed_ecg_cache[cache_key] = (normalized_signal, mean_val, std_val)
-        
+
         return cls._processed_ecg_cache[cache_key]
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
