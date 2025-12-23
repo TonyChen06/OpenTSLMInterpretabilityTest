@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: MIT
 
 from types import SimpleNamespace
+from collections import defaultdict
+import numpy as np
 from opentslm.model.encoder.CNNTokenizer import CNNTokenizer
 from opentslm.model.llm.TimeSeriesFlamingoWithTrainableEncoder import (
     TimeSeriesFlamingoWithTrainableEncoder,
@@ -12,7 +14,7 @@ from open_flamingo.src.flamingo_lm import FlamingoLMMixin
 from open_flamingo.src.utils import extend_instance
 import torch
 import torch._dynamo
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from opentslm.model_config import ENCODER_OUTPUT_DIM
@@ -21,6 +23,189 @@ from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+
+
+class SignalContributionTracker:
+    """
+    Tracks signal contribution metrics during model forward passes.
+
+    Measures:
+    - residual_stream: |x| magnitude of input to cross-attention blocks
+    - total_contribution: |x_new - x| total contribution from block (attn + ff)
+    - ecg_signal_contribution: |raw_attn * tanh(attn_gate)| - the TRUE ECG signal contribution
+    - ff_contribution: |raw_ff * tanh(ff_gate)| - feedforward contribution (not signal-related)
+    """
+
+    def __init__(self):
+        self.measurements = defaultdict(list)
+        self.hooks = []
+        self._enabled = False
+        # Temporary storage for raw attention output (captured by inner hook)
+        self._pending_raw_attn = {}
+        self._pending_raw_ff = {}
+
+    def _make_attn_hook(self, layer_idx: int):
+        """Hook for the inner attention module to capture raw output BEFORE gating."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+            with torch.no_grad():
+                self._pending_raw_attn[layer_idx] = output.norm(dim=-1).mean().item()
+        return hook
+
+    def _make_ff_hook(self, layer_idx: int):
+        """Hook for the inner feedforward module to capture raw output BEFORE gating."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+            with torch.no_grad():
+                self._pending_raw_ff[layer_idx] = output.norm(dim=-1).mean().item()
+        return hook
+
+    def _make_block_hook(self, layer_idx: int, layer):
+        """Create a forward hook for the outer GatedCrossAttentionBlock."""
+        def hook(module, inputs, output):
+            if not self._enabled:
+                return
+
+            x = inputs[0]  # residual stream input
+            x_new = output  # output after cross-attn block
+
+            with torch.no_grad():
+                # |x| - residual stream magnitude
+                x_magnitude = x.norm(dim=-1).mean().item()
+
+                # Total contribution (attn + ff)
+                total_contribution = (x_new - x).norm(dim=-1).mean().item()
+
+                # Get gate values
+                attn_gate_tanh = torch.tanh(layer.attn_gate).item()
+                ff_gate_tanh = torch.tanh(layer.ff_gate).item()
+
+                # Get raw outputs captured by inner hooks
+                raw_attn = self._pending_raw_attn.get(layer_idx, 0.0)
+                raw_ff = self._pending_raw_ff.get(layer_idx, 0.0)
+
+                # TRUE ECG signal contribution = raw_attn * |tanh(attn_gate)|
+                ecg_contribution = raw_attn * abs(attn_gate_tanh)
+
+                # FF contribution (not from ECG signal)
+                ff_contribution = raw_ff * abs(ff_gate_tanh)
+
+                # Percentages
+                if x_magnitude > 1e-8:
+                    total_pct = (total_contribution / x_magnitude) * 100
+                    ecg_pct = (ecg_contribution / x_magnitude) * 100
+                    ff_pct = (ff_contribution / x_magnitude) * 100
+                else:
+                    total_pct = ecg_pct = ff_pct = 0.0
+
+                self.measurements[f'layer_{layer_idx}'].append({
+                    'residual_stream': x_magnitude,
+                    'total_contribution': total_contribution,
+                    'total_contribution_pct': total_pct,
+                    'raw_attn_output': raw_attn,
+                    'attn_gate_tanh': attn_gate_tanh,
+                    'ecg_signal_contribution': ecg_contribution,
+                    'ecg_signal_contribution_pct': ecg_pct,
+                    'raw_ff_output': raw_ff,
+                    'ff_gate_tanh': ff_gate_tanh,
+                    'ff_contribution': ff_contribution,
+                    'ff_contribution_pct': ff_pct,
+                })
+
+                # Clear pending values
+                self._pending_raw_attn.pop(layer_idx, None)
+                self._pending_raw_ff.pop(layer_idx, None)
+
+        return hook
+
+    def register_hooks(self, model):
+        """Register hooks on all gated cross-attention blocks and their inner modules."""
+        self.remove_hooks()  # Clear any existing hooks
+
+        # Find the gated cross-attention layers
+        lang_encoder = model.lang_encoder
+
+        if hasattr(lang_encoder, 'gated_cross_attn_layers'):
+            for idx, layer in enumerate(lang_encoder.gated_cross_attn_layers):
+                if layer is not None:
+                    # Hook the inner attention module (captures raw output before gating)
+                    h1 = layer.attn.register_forward_hook(self._make_attn_hook(idx))
+                    self.hooks.append(h1)
+
+                    # Hook the inner feedforward module
+                    h2 = layer.ff.register_forward_hook(self._make_ff_hook(idx))
+                    self.hooks.append(h2)
+
+                    # Hook the outer block (calculates final metrics)
+                    h3 = layer.register_forward_hook(self._make_block_hook(idx, layer))
+                    self.hooks.append(h3)
+
+            n_layers = len([l for l in lang_encoder.gated_cross_attn_layers if l is not None])
+            print(f"[SignalContributionTracker] Registered hooks on {n_layers} layers ({len(self.hooks)} total hooks)")
+        else:
+            print("[SignalContributionTracker] Warning: Could not find gated_cross_attn_layers")
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+
+    def enable(self):
+        """Enable measurement collection."""
+        self._enabled = True
+
+    def disable(self):
+        """Disable measurement collection."""
+        self._enabled = False
+
+    def clear(self):
+        """Clear all measurements."""
+        self.measurements.clear()
+
+    def get_summary(self) -> Dict:
+        """Get summary statistics across all samples."""
+        if not self.measurements:
+            return {'error': 'No measurements collected'}
+
+        summary = {}
+
+        # Per-layer statistics
+        for layer_name, measurements in self.measurements.items():
+            summary[layer_name] = {
+                'residual_stream_mean': float(np.mean([m['residual_stream'] for m in measurements])),
+                'total_contribution_mean': float(np.mean([m['total_contribution'] for m in measurements])),
+                'total_contribution_pct_mean': float(np.mean([m['total_contribution_pct'] for m in measurements])),
+                'raw_attn_output_mean': float(np.mean([m['raw_attn_output'] for m in measurements])),
+                'attn_gate_tanh_mean': float(np.mean([m['attn_gate_tanh'] for m in measurements])),
+                'ecg_signal_contribution_mean': float(np.mean([m['ecg_signal_contribution'] for m in measurements])),
+                'ecg_signal_contribution_pct_mean': float(np.mean([m['ecg_signal_contribution_pct'] for m in measurements])),
+                'raw_ff_output_mean': float(np.mean([m['raw_ff_output'] for m in measurements])),
+                'ff_gate_tanh_mean': float(np.mean([m['ff_gate_tanh'] for m in measurements])),
+                'ff_contribution_mean': float(np.mean([m['ff_contribution'] for m in measurements])),
+                'ff_contribution_pct_mean': float(np.mean([m['ff_contribution_pct'] for m in measurements])),
+                'n_samples': len(measurements)
+            }
+
+        # Overall average across all layers
+        all_measurements = []
+        for measurements in self.measurements.values():
+            all_measurements.extend(measurements)
+
+        summary['overall'] = {
+            'residual_stream_mean': float(np.mean([m['residual_stream'] for m in all_measurements])),
+            'total_contribution_mean': float(np.mean([m['total_contribution'] for m in all_measurements])),
+            'total_contribution_pct_mean': float(np.mean([m['total_contribution_pct'] for m in all_measurements])),
+            'ecg_signal_contribution_mean': float(np.mean([m['ecg_signal_contribution'] for m in all_measurements])),
+            'ecg_signal_contribution_pct_mean': float(np.mean([m['ecg_signal_contribution_pct'] for m in all_measurements])),
+            'ff_contribution_mean': float(np.mean([m['ff_contribution'] for m in all_measurements])),
+            'ff_contribution_pct_mean': float(np.mean([m['ff_contribution_pct'] for m in all_measurements])),
+            'n_measurements': len(all_measurements)
+        }
+
+        return summary
 
 # Monkey-patch FlamingoLayer to add attention_type property for compatibility with newer transformers
 from open_flamingo.src.flamingo_lm import FlamingoLayer
@@ -146,11 +331,83 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             # TODO: investigate also training the output embeddings when untied
 
         # additonally unfreeze encoder
-        model.vision_encoder.requires_grad_(True)
+        # Note: Flamingo.__init__ extracts vision_encoder.visual, so vision_encoder IS the CNNTokenizer
+        # However, in some cases vision_encoder may be a SimpleNamespace wrapper, so check first
+        if hasattr(model.vision_encoder, 'requires_grad_'):
+            model.vision_encoder.requires_grad_(True)
+        elif hasattr(model.vision_encoder, 'visual') and hasattr(model.vision_encoder.visual, 'requires_grad_'):
+            model.vision_encoder.visual.requires_grad_(True)
 
         self.model = model
         self.llm = model
         self.text_tokenizer = text_tokenizer
+
+        # Initialize signal contribution tracker (disabled by default)
+        self._signal_tracker = SignalContributionTracker()
+        self._signal_tracker.register_hooks(model)
+
+    def enable_signal_tracking(self):
+        """Enable signal contribution tracking during forward passes."""
+        self._signal_tracker.enable()
+        print("[OpenTSLMFlamingo] Signal contribution tracking ENABLED")
+
+    def disable_signal_tracking(self):
+        """Disable signal contribution tracking."""
+        self._signal_tracker.disable()
+        print("[OpenTSLMFlamingo] Signal contribution tracking DISABLED")
+
+    def clear_signal_measurements(self):
+        """Clear all collected signal contribution measurements."""
+        self._signal_tracker.clear()
+
+    def get_signal_contribution_summary(self) -> Dict:
+        """
+        Get summary of signal contribution metrics.
+
+        Returns dict with:
+        - Per-layer: residual_stream, raw_attn_output, ecg_signal_contribution, raw_ff_output, ff_contribution
+        - Overall: ecg_signal_contribution_pct (TRUE ECG influence), ff_contribution_pct, total_contribution_pct
+        """
+        return self._signal_tracker.get_summary()
+
+    def print_signal_contribution_summary(self):
+        """Print a formatted summary of signal contribution metrics."""
+        summary = self.get_signal_contribution_summary()
+
+        if 'error' in summary:
+            print(f"[Signal Contribution] {summary['error']}")
+            return
+
+        print("\n" + "=" * 70)
+        print("SIGNAL CONTRIBUTION SUMMARY")
+        print("=" * 70)
+
+        overall = summary['overall']
+        print(f"\nOverall (across all {overall['n_measurements']} measurements):")
+        print(f"  Residual stream magnitude:      {overall['residual_stream_mean']:.4f}")
+        print(f"\n  *** TRUE ECG SIGNAL CONTRIBUTION ***")
+        print(f"  ECG signal contribution:        {overall['ecg_signal_contribution_mean']:.6f}")
+        print(f"  ECG signal contribution %:      {overall['ecg_signal_contribution_pct_mean']:.4f}%")
+        print(f"\n  Feedforward contribution:")
+        print(f"  FF contribution:                {overall['ff_contribution_mean']:.4f}")
+        print(f"  FF contribution %:              {overall['ff_contribution_pct_mean']:.4f}%")
+        print(f"\n  Total (ECG + FF):")
+        print(f"  Total contribution:             {overall['total_contribution_mean']:.4f}")
+        print(f"  Total contribution %:           {overall['total_contribution_pct_mean']:.4f}%")
+
+        print(f"\nPer-layer breakdown:")
+        for layer_name in sorted(summary.keys(), key=lambda x: int(x.split('_')[1]) if x != 'overall' else -1):
+            if layer_name == 'overall':
+                continue
+            s = summary[layer_name]
+            print(f"  {layer_name}: ECG={s['ecg_signal_contribution_pct_mean']:.4f}%, FF={s['ff_contribution_pct_mean']:.4f}%, Total={s['total_contribution_pct_mean']:.4f}%")
+
+        print("=" * 70)
+
+    @property
+    def tokenizer(self):
+        """Alias for text_tokenizer for compatibility."""
+        return self.text_tokenizer
 
     def pad_and_apply_batch(
         self, batch: List[Dict[str, any]], include_labels: bool

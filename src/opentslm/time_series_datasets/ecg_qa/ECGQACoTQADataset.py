@@ -29,7 +29,7 @@ class ECGQACoTQADataset(QADataset):
     def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str,
                  format_sample_str: bool = False, time_series_format_function=None,
                  max_samples: int = None, exclude_comparison: bool = False,
-                 preload_processed_data: bool = True):
+                 preload_processed_data: bool = True, eval_only: bool = False):
         """
         Initialize ECG-QA CoT Dataset.
 
@@ -41,10 +41,15 @@ class ECGQACoTQADataset(QADataset):
             max_samples: Maximum number of samples per split (for testing)
             exclude_comparison: If True, exclude comparison questions (question_type starting with "comparison_")
             preload_processed_data: If True, preload processed ECG data for maximum speed (uses more memory). Default: True
+            eval_only: If True, only load the requested split (faster for evaluation). Default: False
         """
         self.max_samples = max_samples
         self.exclude_comparison = exclude_comparison
         self.preload_processed_data = preload_processed_data
+        self.eval_only = eval_only
+        # Store split before calling super().__init__() because _load_splits() needs it
+        # (parent class sets self.split after calling _load_splits)
+        self.split = split
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
 
     @classmethod
@@ -58,11 +63,18 @@ class ECGQACoTQADataset(QADataset):
         Args:
             use_noise: If True, replace real ECG signals with noise
             noise_type: Type of noise ("gaussian", "shuffle", "zero", "uniform")
-            noise_seed: Random seed for reproducibility
+            noise_seed: Random seed for reproducibility (set ONCE here, not per-signal)
         """
+        # Clear all caches to ensure noise mode is applied fresh
+        # This is critical because the parent class caches formatted samples at the class level
+        cls.clear_caches()
+
         cls._use_noise = use_noise
         cls._noise_type = noise_type
         cls._noise_seed = noise_seed
+        # Set seed ONCE here, so subsequent calls generate different sequences
+        if noise_seed is not None:
+            np.random.seed(noise_seed)
         if use_noise:
             print(f"[NOISE MODE] ECG signals will be replaced with '{noise_type}' noise (seed={noise_seed})")
 
@@ -87,11 +99,10 @@ class ECGQACoTQADataset(QADataset):
 
         Returns:
             Noise signal as numpy array
-        """
-        # Set seed if specified for reproducibility
-        if cls._noise_seed is not None:
-            np.random.seed(cls._noise_seed)
 
+        Note: The random seed is set ONCE in set_noise_mode(), not here.
+              This ensures each signal gets unique noise while still being reproducible.
+        """
         if noise_type == "gaussian":
             # Standard Gaussian noise (mean=0, std=1)
             return np.random.randn(length)
@@ -115,12 +126,27 @@ class ECGQACoTQADataset(QADataset):
         """Load the ECG-QA CoT dataset splits."""
         print("Loading ECG-QA CoT dataset splits...")
         train, val, test = load_ecg_qa_cot_splits()
-        
+
+        # If eval_only mode, only keep the requested split
+        if self.eval_only:
+            print(f"[eval_only mode] Only loading '{self.split}' split for faster evaluation...")
+            if self.split == "train":
+                val = Dataset.from_list([])
+                test = Dataset.from_list([])
+            elif self.split == "validation":
+                train = Dataset.from_list([])
+                test = Dataset.from_list([])
+            elif self.split == "test":
+                train = Dataset.from_list([])
+                val = Dataset.from_list([])
+
         # Filter out comparison questions if requested
         if self.exclude_comparison:
             print("Filtering out comparison questions...")
-            
+
             def filter_comparison(dataset):
+                if len(dataset) == 0:
+                    return dataset
                 filtered_data = []
                 for sample in dataset:
                     question_type = sample.get("question_type")
@@ -129,20 +155,21 @@ class ECGQACoTQADataset(QADataset):
                     if not question_type.startswith("comparison"):
                         filtered_data.append(sample)
                 return Dataset.from_list(filtered_data)
-            
+
             original_train_len = len(train)
             original_val_len = len(val)
             original_test_len = len(test)
-            
+
             train = filter_comparison(train)
             val = filter_comparison(val)
             test = filter_comparison(test)
-            
-            print(f"Filtered out comparison questions:")
-            print(f"  Train: {original_train_len} -> {len(train)} ({original_train_len - len(train)} removed)")
-            print(f"  Val: {original_val_len} -> {len(val)} ({original_val_len - len(val)} removed)")
-            print(f"  Test: {original_test_len} -> {len(test)} ({original_test_len - len(test)} removed)")
-        
+
+            if not self.eval_only:
+                print(f"Filtered out comparison questions:")
+                print(f"  Train: {original_train_len} -> {len(train)} ({original_train_len - len(train)} removed)")
+                print(f"  Val: {original_val_len} -> {len(val)} ({original_val_len - len(val)} removed)")
+                print(f"  Test: {original_test_len} -> {len(test)} ({original_test_len - len(test)} removed)")
+
         # Limit samples for faster testing if requested
         if self.max_samples:
             print(f"Limiting to {self.max_samples} samples per split for testing...")
@@ -152,14 +179,17 @@ class ECGQACoTQADataset(QADataset):
                 val = val.select(range(self.max_samples))
             if len(test) > self.max_samples:
                 test = test.select(range(self.max_samples))
-        
+
+        # Only preload splits that have data
+        splits_to_preload = [s for s in [train, val, test] if len(s) > 0]
+
         # Preload ECG data for better performance
-        self.preload_ecg_data([train, val, test])
-        
+        self.preload_ecg_data(splits_to_preload)
+
         # Optionally preload processed data for maximum performance
         if self.preload_processed_data:
-            self.preload_processed_ecg_data([train, val, test])
-        
+            self.preload_processed_ecg_data(splits_to_preload)
+
         return train, val, test
 
     def _get_answer(self, row) -> str:
@@ -423,10 +453,20 @@ Make sure that your last word is the answer. You MUST end your response with "An
     
     @classmethod
     def clear_caches(cls):
-        """Clear all caches to free memory."""
+        """Clear all caches to free memory and force dataset reload."""
         cls._ecg_data_cache.clear()
         cls._processed_ecg_cache.clear()
         cls._template_answers_cache = None
+        # Also clear the parent class 'loaded' flag to force re-formatting
+        # This is critical when switching between noise/no-noise modes
+        if hasattr(cls, 'loaded'):
+            delattr(cls, 'loaded')
+        if hasattr(cls, '_train_dataset'):
+            delattr(cls, '_train_dataset')
+        if hasattr(cls, '_validation_dataset'):
+            delattr(cls, '_validation_dataset')
+        if hasattr(cls, '_test_dataset'):
+            delattr(cls, '_test_dataset')
         print("Cleared all ECG-QA CoT dataset caches")
     
     @classmethod
