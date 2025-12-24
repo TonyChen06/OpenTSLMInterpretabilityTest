@@ -198,8 +198,12 @@ class SignalContributionTracker:
             'residual_stream_mean': float(np.mean([m['residual_stream'] for m in all_measurements])),
             'total_contribution_mean': float(np.mean([m['total_contribution'] for m in all_measurements])),
             'total_contribution_pct_mean': float(np.mean([m['total_contribution_pct'] for m in all_measurements])),
+            'raw_attn_output_mean': float(np.mean([m['raw_attn_output'] for m in all_measurements])),
+            'attn_gate_tanh_mean': float(np.mean([m['attn_gate_tanh'] for m in all_measurements])),
             'ecg_signal_contribution_mean': float(np.mean([m['ecg_signal_contribution'] for m in all_measurements])),
             'ecg_signal_contribution_pct_mean': float(np.mean([m['ecg_signal_contribution_pct'] for m in all_measurements])),
+            'raw_ff_output_mean': float(np.mean([m['raw_ff_output'] for m in all_measurements])),
+            'ff_gate_tanh_mean': float(np.mean([m['ff_gate_tanh'] for m in all_measurements])),
             'ff_contribution_mean': float(np.mean([m['ff_contribution'] for m in all_measurements])),
             'ff_contribution_pct_mean': float(np.mean([m['ff_contribution_pct'] for m in all_measurements])),
             'n_measurements': len(all_measurements)
@@ -385,13 +389,19 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         overall = summary['overall']
         print(f"\nOverall (across all {overall['n_measurements']} measurements):")
         print(f"  Residual stream magnitude:      {overall['residual_stream_mean']:.4f}")
+        print(f"\n  *** RAW MODULE OUTPUTS (before gating) ***")
+        print(f"  Raw attention output:           {overall['raw_attn_output_mean']:.4f}")
+        print(f"  Raw FF output:                  {overall['raw_ff_output_mean']:.4f}")
+        print(f"\n  *** GATE VALUES ***")
+        print(f"  tanh(attn_gate):                {overall['attn_gate_tanh_mean']:.6f}")
+        print(f"  tanh(ff_gate):                  {overall['ff_gate_tanh_mean']:.6f}")
         print(f"\n  *** TRUE ECG SIGNAL CONTRIBUTION ***")
-        print(f"  ECG signal contribution:        {overall['ecg_signal_contribution_mean']:.6f}")
-        print(f"  ECG signal contribution %:      {overall['ecg_signal_contribution_pct_mean']:.4f}%")
-        print(f"\n  Feedforward contribution:")
-        print(f"  FF contribution:                {overall['ff_contribution_mean']:.4f}")
+        print(f"  ECG contribution (raw*gate):    {overall['ecg_signal_contribution_mean']:.6f}")
+        print(f"  ECG contribution %:             {overall['ecg_signal_contribution_pct_mean']:.4f}%")
+        print(f"\n  *** FEEDFORWARD CONTRIBUTION ***")
+        print(f"  FF contribution (raw*gate):     {overall['ff_contribution_mean']:.4f}")
         print(f"  FF contribution %:              {overall['ff_contribution_pct_mean']:.4f}%")
-        print(f"\n  Total (ECG + FF):")
+        print(f"\n  *** TOTAL (ECG + FF) ***")
         print(f"  Total contribution:             {overall['total_contribution_mean']:.4f}")
         print(f"  Total contribution %:           {overall['total_contribution_pct_mean']:.4f}%")
 

@@ -27,23 +27,26 @@ class TimeSeriesFlamingoWithTrainableEncoder(Flamingo):
     # Here, we use a TimeSeriesCNNEncoder, which is trainable
     def _encode_vision_x(self, vision_x):
         # Handle time series data while still using the TimeSeriesCNNEncoder
+        # Note: vision_encoder may be a SimpleNamespace wrapper with .visual attribute,
+        # or it may be the encoder directly (after loading from checkpoint)
+        encoder = getattr(self.vision_encoder, 'visual', self.vision_encoder)
+
         if vision_x.ndim == 4:  # For shape (b, T_img, F, features)
             b, T, F, features = vision_x.shape
-            
+
             # Flatten batch, time and frame dimensions
             vision_x = rearrange(vision_x, "b T F c -> (b T F) c")
-            
+
             # Process through encoder - will return [batch, patches, features]
-                
-            vision_x = self.vision_encoder(vision_x)  # Shape: [(b*T*F), patches, features]
-                
+            vision_x = encoder(vision_x)  # Shape: [(b*T*F), patches, features]
+
             # Reshape to expected format for perceiver
             # The transformer output already has the "tokens" dimension we need (patches)
             vision_x = rearrange(vision_x, "(b T F) p d -> b T F p d", b=b, T=T, F=F)
-            
+
             # Process through perceiver
             vision_x = self.perceiver(vision_x)
-            
+
         else:
             # Original image processing path
             assert vision_x.ndim == 6, "vision_x should be of shape (b, T_img, F, C, H, W)"
@@ -51,8 +54,8 @@ class TimeSeriesFlamingoWithTrainableEncoder(Flamingo):
             assert F == 1, "Only single frame supported"
 
             vision_x = rearrange(vision_x, "b T F c h w -> (b T F) c h w")
-            
-            vision_x = self.vision_encoder(vision_x)[1]
+
+            vision_x = encoder(vision_x)[1]
             vision_x = rearrange(vision_x, "(b T F) v d -> b T F v d", b=b, T=T, F=F)
             vision_x = self.perceiver(vision_x)
 
