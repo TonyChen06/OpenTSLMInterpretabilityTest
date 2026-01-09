@@ -1335,7 +1335,7 @@ class CurriculumTrainer:
         """Stage 5: Chain-of-Thought Reasoning (ECG QA CoT).
 
         Configuration:
-        - Epochs: 60
+        - Epochs: 3
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
@@ -1345,7 +1345,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage5_ecg_cot",
             dataset_class=ECGQACoTQADataset,
-            num_epochs=60,
+            num_epochs=3,
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
